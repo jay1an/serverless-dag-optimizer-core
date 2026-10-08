@@ -1,0 +1,345 @@
+diff --git a/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/ContainerPool.scala b/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/ContainerPool.scala
+index 3c2ebd9c..abc3ea24 100644
+--- a/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/ContainerPool.scala
++++ b/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/ContainerPool.scala
+@@ -19,7 +19,8 @@ package org.apache.openwhisk.core.containerpool
+ 
+ import akka.actor.{Actor, ActorRef, ActorRefFactory, Props}
+ import org.apache.openwhisk.common.{Logging, LoggingMarkers, MetricEmitter, TransactionId}
+-import org.apache.openwhisk.core.connector.MessageFeed
++import org.apache.openwhisk.core.connector.{ActivationMessage, MessageFeed}
++import spray.json.{JsArray, JsBoolean, JsNumber, JsObject, JsString}
+ import org.apache.openwhisk.core.entity.ExecManifest.ReactivePrewarmingConfig
+ import org.apache.openwhisk.core.entity._
+ import org.apache.openwhisk.core.entity.size._
+@@ -35,6 +36,9 @@ case object EmitMetrics
+ 
+ case object AdjustPrewarmedContainer
+ 
++/** Ask the pool for per-action@tier warm state (free/busy/warming + oldest free idle age); reply is a JSON string. */
++case object GetPoolStats
++
+ /**
+  * A pool managing containers to run actions on.
+  *
+@@ -68,6 +72,48 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
+   var busyPool = immutable.Map.empty[ActorRef, ContainerData]
+   var prewarmedPool = immutable.Map.empty[ActorRef, PreWarmedData]
+   var prewarmStartingPool = immutable.Map.empty[ActorRef, (String, ByteSize)]
++  // JIT warm-container reservation: containerRef -> (owner key, lease deadline). Prevents a concurrent
++  // workflow from stealing a just-warmed container during the warmup -> real-dispatch gap. The reservation
++  // is set when a warmup run lands on a container, cleared when the owner's real invoke claims it, and
++  // ignored once expired (see schedule). reservationTtlMs is the lease length (env-tunable).
++  var reservations = immutable.Map.empty[ActorRef, (String, Deadline)]
++  private val reservationTtlMs: Long = sys.env.getOrElse("RESERVATION_TTL_MS", "5000").toLong
++  private def reservationKeyOf(msg: ActivationMessage): Option[String] = msg.content match {
++    case Some(o: JsObject) => o.fields.get("__ow_reservation_key").collect { case JsString(s) => s }
++    case _                 => None
++  }
++  private def isWarmupRun(msg: ActivationMessage): Boolean = msg.content match {
++    case Some(o: JsObject) => o.fields.get("__warmup").exists { case JsBoolean(b) => b; case _ => false }
++    case _                 => false
++  }
++  /** Per-action@tier warm-pool snapshot as a compact JSON array, for the invoker /poolState route. */
++  private def poolStatsJson(): String = {
++    val now = java.time.Instant.now()
++    def info(d: ContainerData): Option[(String, Long, String, java.time.Instant)] = d match {
++      case w: WarmedData =>
++        Some((w.action.name.asString, w.memoryLimit.toMB, if (w.activeActivationCount == 0) "free" else "busy", w.lastUsed))
++      case w: WarmingData     => Some((w.action.name.asString, w.memoryLimit.toMB, "warming", w.lastUsed))
++      case w: WarmingColdData => Some((w.action.name.asString, w.memoryLimit.toMB, "warming", w.lastUsed))
++      case _                  => None
++    }
++    val rows = (freePool ++ busyPool).values.flatMap(info).toSeq
++    val entries = rows.groupBy(r => (r._1, r._2)).map {
++      case ((actionName, mb), items) =>
++        val free = items.count(_._3 == "free")
++        val busy = items.count(_._3 == "busy")
++        val warming = items.count(_._3 == "warming")
++        val oldestFreeIdleMs =
++          items.filter(_._3 == "free").map(r => java.time.Duration.between(r._4, now).toMillis).fold(0L)(_ max _)
++        JsObject(
++          "action" -> JsString(actionName),
++          "memoryMB" -> JsNumber(mb),
++          "free" -> JsNumber(free),
++          "busy" -> JsNumber(busy),
++          "warming" -> JsNumber(warming),
++          "oldestFreeIdleMs" -> JsNumber(oldestFreeIdleMs))
++    }.toVector
++    JsArray(entries).compactPrint
++  }
+   // If all memory slots are occupied and if there is currently no container to be removed, than the actions will be
+   // buffered here to keep order of computation.
+   // Otherwise actions with small memory-limits could block actions with large memory limits.
+@@ -137,7 +183,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
+         val createdContainer =
+           // Schedule a job to a warm container
+           ContainerPool
+-            .schedule(r.action, r.msg.user.namespace.name, freePool)
++            .schedule(r.action, r.msg.user.namespace.name, freePool, reservations, reservationKeyOf(r.msg))
+             .map(container => (container, container._2.initingState)) //warmed, warming, and warmingCold always know their state
+             .orElse(
+               // There was no warm/warming/warmingCold container. Try to take a prewarm container or a cold container.
+@@ -172,6 +218,16 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
+ 
+         createdContainer match {
+           case Some(((actor, data), containerState)) =>
++            // Reserve this freshly warmed container for its owning request when this run is a warmup, or
++            // release the reservation when the owner's real invoke claims it. Other concurrent workflows
++            // are barred from this container until it is claimed or the lease expires (see schedule).
++            reservationKeyOf(r.msg).foreach { key =>
++              if (isWarmupRun(r.msg)) {
++                reservations = reservations + (actor -> (key, reservationTtlMs.millis.fromNow))
++              } else if (reservations.get(actor).exists(_._1 == key)) {
++                reservations = reservations - actor
++              }
++            }
+             //increment active count before storing in pool map
+             val newData = data.nextRun(r)
+             val container = newData.getContainer
+@@ -277,6 +333,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
+       busyPool.get(sender()).foreach { _ =>
+         busyPool = busyPool - sender()
+       }
++      reservations = reservations - sender()
+       processBufferOrFeed()
+ 
+       // in case this was a prewarm
+@@ -303,9 +360,13 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
+     case RescheduleJob =>
+       freePool = freePool - sender()
+       busyPool = busyPool - sender()
++      reservations = reservations - sender()
+     case EmitMetrics =>
+       emitMetrics()
+ 
++    case GetPoolStats =>
++      sender() ! poolStatsJson()
++
+     case AdjustPrewarmedContainer =>
+       adjustPrewarmedContainer(false, true)
+   }
+@@ -508,22 +569,45 @@ object ContainerPool {
+    */
+   protected[containerpool] def schedule[A](action: ExecutableWhiskAction,
+                                            invocationNamespace: EntityName,
+-                                           idles: Map[A, ContainerData]): Option[(A, ContainerData)] = {
++                                           idles: Map[A, ContainerData],
++                                           reservations: Map[A, (String, Deadline)] = Map.empty,
++                                           requestKey: Option[String] = None): Option[(A, ContainerData)] = {
++    def reservedForOther(ref: A): Boolean =
++      reservations.get(ref).exists { case (k, until) => until.hasTimeLeft() && !requestKey.contains(k) }
++    def reservedForMe(ref: A): Boolean =
++      requestKey.exists(k => reservations.get(ref).exists { case (rk, until) => rk == k && until.hasTimeLeft() })
++
+     idles
++    // 1) prefer a warm container reserved for this request
+       .find {
+-        case (_, c @ WarmedData(_, `invocationNamespace`, `action`, _, _, _)) if c.hasCapacity() => true
+-        case _                                                                                   => false
++        case (ref, c @ WarmedData(_, `invocationNamespace`, `action`, _, _, _))
++            if c.hasCapacity() && reservedForMe(ref) =>
++          true
++        case _ => false
++      }
++      // 2) otherwise a warm container that is not reserved for someone else
++      .orElse {
++        idles.find {
++          case (ref, c @ WarmedData(_, `invocationNamespace`, `action`, _, _, _))
++              if c.hasCapacity() && !reservedForOther(ref) =>
++            true
++          case _ => false
++        }
+       }
+       .orElse {
+         idles.find {
+-          case (_, c @ WarmingData(_, `invocationNamespace`, `action`, _, _)) if c.hasCapacity() => true
+-          case _                                                                                 => false
++          case (ref, c @ WarmingData(_, `invocationNamespace`, `action`, _, _))
++              if c.hasCapacity() && !reservedForOther(ref) =>
++            true
++          case _ => false
+         }
+       }
+       .orElse {
+         idles.find {
+-          case (_, c @ WarmingColdData(`invocationNamespace`, `action`, _, _)) if c.hasCapacity() => true
+-          case _                                                                                  => false
++          case (ref, c @ WarmingColdData(`invocationNamespace`, `action`, _, _))
++              if c.hasCapacity() && !reservedForOther(ref) =>
++            true
++          case _ => false
+         }
+       }
+   }
+diff --git a/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/kubernetes/KubernetesClient.scala b/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/kubernetes/KubernetesClient.scala
+index ccfcf5c4..801bc675 100644
+--- a/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/kubernetes/KubernetesClient.scala
++++ b/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/kubernetes/KubernetesClient.scala
+@@ -22,12 +22,12 @@ import java.net.SocketTimeoutException
+ import java.time.format.DateTimeFormatterBuilder
+ import java.time.temporal.ChronoField
+ import java.time.{Instant, ZoneId}
++import java.util.concurrent.TimeUnit
+ import akka.actor.ActorSystem
+ import akka.event.Logging.ErrorLevel
+ import akka.event.Logging.InfoLevel
+ import akka.http.scaladsl.model.Uri
+ import akka.http.scaladsl.model.Uri.{Path, Query}
+-import akka.pattern.after
+ import akka.stream.scaladsl.Source
+ import akka.stream.stage._
+ import akka.stream.{Attributes, Outlet, SourceShape}
+@@ -133,7 +133,6 @@ class KubernetesClient(
+     extends KubernetesApi
+     with ProcessRunner {
+   implicit protected val ec = executionContext
+-  implicit protected val scheduler = as.scheduler
+   implicit protected val kubeRestClient = testClient.getOrElse {
+     val configBuilder = new ConfigBuilder()
+       .withConnectionTimeout(config.timeouts.logs.toMillis.toInt)
+@@ -323,43 +322,47 @@ class KubernetesClient(
+     new KubernetesContainer(id, addr, workerIP, nativeContainerId, portFwd)
+   }
+ 
+-  // check for ready status every 1 second until timeout (minus the start time, which is the time for the pod create call) has past
+-  private def waitForPod(namespace: String,
+-                         pod: Pod,
+-                         start: Instant,
+-                         timeout: FiniteDuration,
+-                         deadlineOpt: Option[Deadline] = None): Future[Pod] = {
++  private def podStartupFailure(pod: Pod): Option[Throwable] = {
++    val waitingStates = Try {
++      pod.getStatus.getContainerStatuses.asScala.flatMap(status => Option(status.getState.getWaiting))
++    }.getOrElse(Seq.empty)
++
++    if (waitingStates.exists(waiting => imagePullFailedMsgs.contains(waiting.getReason))) {
++      Some(KubernetesImagePullFailedException(s"Failed to pull image for pod ${pod.getMetadata.getName}"))
++    } else if (waitingStates.exists(waiting => Option(waiting.getMessage).exists(_.contains(Messages.commandNotFoundError)))) {
++      Some(KubernetesImageCommandNotFoundException(Messages.commandNotFoundError))
++    } else {
++      None
++    }
++  }
++
++  // Fabric8 performs an initial GET and then watches resourceVersion updates until the pod is Ready.
++  private def waitForPod(namespace: String, pod: Pod, start: Instant, timeout: FiniteDuration): Future[Pod] = {
+     val readyPod = kubeRestClient
+       .pods()
+       .inNamespace(namespace)
+       .withName(pod.getMetadata.getName)
+-    val deadline = deadlineOpt.getOrElse((timeout - (System.currentTimeMillis() - start.toEpochMilli).millis).fromNow)
+-    if (!readyPod.isReady) {
+-      // when action pod is failed while pulling images, we need to let users know that
+-      val imagePullErr = Try {
+-        readyPod.get.getStatus.getContainerStatuses.asScala.exists { status =>
+-          imagePullFailedMsgs.contains(status.getState.getWaiting.getReason)
+-        }
+-      } getOrElse false
+-      // when command not found in image, we need to let users know that as well
+-      val commandNotFoundErr = Try {
+-        readyPod.get.getStatus.getContainerStatuses.asScala.exists { status =>
+-          status.getState.getWaiting.getMessage.contains(Messages.commandNotFoundError)
+-        }
+-      } getOrElse false
+-      if (imagePullErr) {
+-        Future.failed(KubernetesImagePullFailedException(s"Failed to pull image for pod ${pod.getMetadata.getName}"))
+-      } else if (commandNotFoundErr) {
+-        Future.failed(KubernetesImageCommandNotFoundException(Messages.commandNotFoundError))
+-      } else if (deadline.isOverdue()) {
+-        Future.failed(KubernetesPodReadyTimeoutException(timeout))
+-      } else {
+-        after(1.seconds, scheduler) {
+-          waitForPod(namespace, pod, start, timeout, Some(deadline))
++
++    val elapsed = (System.currentTimeMillis() - start.toEpochMilli).millis
++    val remaining = timeout - elapsed
++    if (remaining.toMillis <= 0) {
++      Future.failed(KubernetesPodReadyTimeoutException(timeout))
++    } else {
++      Future {
++        blocking {
++          readyPod.waitUntilReady(remaining.toMillis, TimeUnit.MILLISECONDS)
+         }
++      }.recoverWith {
++        case e: InterruptedException =>
++          Thread.currentThread().interrupt()
++          Future.failed(e)
++        case e: IllegalArgumentException =>
++          val startupFailure = Try(Option(readyPod.get()).flatMap(podStartupFailure)).getOrElse(None)
++          Future.failed(startupFailure.getOrElse(KubernetesPodReadyTimeoutException(timeout)))
++        case NonFatal(e) =>
++          val startupFailure = Try(Option(readyPod.get()).flatMap(podStartupFailure)).getOrElse(None)
++          Future.failed(startupFailure.getOrElse(e))
+       }
+-    } else {
+-      Future.successful(readyPod.get())
+     }
+   }
+ 
+diff --git a/core/invoker/src/main/scala/org/apache/openwhisk/core/invoker/DefaultInvokerServer.scala b/core/invoker/src/main/scala/org/apache/openwhisk/core/invoker/DefaultInvokerServer.scala
+index f3503b55..291a1e5c 100644
+--- a/core/invoker/src/main/scala/org/apache/openwhisk/core/invoker/DefaultInvokerServer.scala
++++ b/core/invoker/src/main/scala/org/apache/openwhisk/core/invoker/DefaultInvokerServer.scala
+@@ -43,7 +43,9 @@ class DefaultInvokerServer(val invoker: InvokerCore, systemUsername: String, sys
+   implicit val jsonPrettyResponsePrinter = PrettyPrinter
+ 
+   override def routes(implicit transid: TransactionId): Route = {
+-    super.routes ~ extractCredentials {
++    super.routes ~ (path("poolState") & get) {
++      invoker.poolState()
++    } ~ extractCredentials {
+       case Some(BasicHttpCredentials(username, password)) if username == systemUsername && password == systemPassword =>
+         (path("enable") & post) {
+           invoker.enable()
+diff --git a/core/invoker/src/main/scala/org/apache/openwhisk/core/invoker/Invoker.scala b/core/invoker/src/main/scala/org/apache/openwhisk/core/invoker/Invoker.scala
+index 99782586..955f32a4 100644
+--- a/core/invoker/src/main/scala/org/apache/openwhisk/core/invoker/Invoker.scala
++++ b/core/invoker/src/main/scala/org/apache/openwhisk/core/invoker/Invoker.scala
+@@ -19,6 +19,7 @@ package org.apache.openwhisk.core.invoker
+ 
+ import akka.Done
+ import akka.actor.{ActorSystem, CoordinatedShutdown}
++import akka.http.scaladsl.server.Directives.reject
+ import akka.http.scaladsl.server.Route
+ import com.typesafe.config.ConfigValueFactory
+ import kamon.Kamon
+@@ -250,6 +251,8 @@ trait InvokerCore {
+   def disable(): Route
+   def isEnabled(): Route
+   def backfillPrewarm(): Route
++  // Default no-op so server variants that don't wire pool state still compile; InvokerReactive overrides it.
++  def poolState(): Route = reject
+ }
+ 
+ /**
+diff --git a/core/invoker/src/main/scala/org/apache/openwhisk/core/invoker/InvokerReactive.scala b/core/invoker/src/main/scala/org/apache/openwhisk/core/invoker/InvokerReactive.scala
+index 31d1f229..ba6f0457 100644
+--- a/core/invoker/src/main/scala/org/apache/openwhisk/core/invoker/InvokerReactive.scala
++++ b/core/invoker/src/main/scala/org/apache/openwhisk/core/invoker/InvokerReactive.scala
+@@ -22,8 +22,11 @@ import java.time.Instant
+ import akka.Done
+ import akka.actor.{ActorRef, ActorRefFactory, ActorSystem, CoordinatedShutdown, Props}
+ import akka.event.Logging.InfoLevel
+-import akka.http.scaladsl.server.Directives.complete
++import akka.http.scaladsl.server.Directives.{complete, onComplete}
+ import akka.http.scaladsl.server.Route
++import akka.http.scaladsl.model.{ContentTypes, HttpEntity}
++import akka.pattern.ask
++import akka.util.Timeout
+ import org.apache.openwhisk.common._
+ import org.apache.openwhisk.common.tracing.WhiskTracerProvider
+ import org.apache.openwhisk.core.ack.{MessagingActiveAck, UserEventSender}
+@@ -332,4 +335,12 @@ class InvokerReactive(
+     complete("not supported")
+   }
+ 
++  override def poolState(): Route = {
++    implicit val timeout: Timeout = Timeout(2.seconds)
++    onComplete((pool ? GetPoolStats).mapTo[String]) {
++      case Success(json) => complete(HttpEntity(ContentTypes.`application/json`, json))
++      case Failure(t)    => complete(s"""{"error":"poolState failed: ${t.getMessage}"}""")
++    }
++  }
++
+ }

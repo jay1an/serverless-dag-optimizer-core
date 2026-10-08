@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "serverless-dag-optimizer-core"
+version = "0.1.0"
+description = "Risk-aware resource planning and runtime control for serverless DAGs"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "pandas",
+    "requests",
+    "scipy",
+    "scikit-learn",
+    "PyYAML",
+]
+
+[project.scripts]
+serverless-dag-core = "serverless_dag.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

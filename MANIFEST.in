@@ -1,0 +1,2 @@
+include README.md
+recursive-include integrations *.patch *.txt
