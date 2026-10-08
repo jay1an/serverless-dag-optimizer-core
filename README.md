@@ -41,5 +41,8 @@ Actions must report `action_duration_ms`, handle `__warmup`, and preserve
 `__ow_reservation_key` for JIT reservation reuse. Cluster deployment and replay
 orchestration are supplied separately.
 
-Upstream patch licenses and notices are retained in `integrations/openwhisk/`.
-The framework license has not yet been selected.
+## License
+
+The framework source in `src/` and its documentation are licensed under the
+[MIT License](LICENSE). The OpenWhisk integration patch retains Apache-2.0
+licensing and upstream notices in `integrations/openwhisk/`.
